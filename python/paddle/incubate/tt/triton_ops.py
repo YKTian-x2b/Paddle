@@ -426,3 +426,300 @@ def weight_only_int8(x, qweight, scales, bias=None, bool_trans_w=True):
         outputs={'out': out},
     )
     return out
+
+
+########################### adaptive layer norm ###############################
+@triton.jit
+def adaptive_layer_norm_kernel(
+    x_ptr,
+    y_ptr,
+    weight_ptr,
+    bias_ptr,
+    scale_ptr,
+    shift_ptr,
+    M,
+    N,
+    seq_size,
+    epsilon,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(axis=0)
+    x_ptr += row * N
+    y_ptr += row * N
+    # Compute mean
+    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for col_off in range(0, N, BLOCK_SIZE):
+        cols = col_off + tl.arange(0, BLOCK_SIZE)
+        eles = tl.load(x_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+        _mean += eles
+    mean = tl.sum(_mean, axis=0) / N
+    # Compute variance
+    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for col_off in range(0, N, BLOCK_SIZE):
+        cols = col_off + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(x_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+        x = tl.where(cols < N, x - mean, 0.0)
+        _var += x * x
+    var = tl.sum(_var, axis=0) / N
+    rstd = 1 / tl.sqrt(var + epsilon)
+    # Compute output
+    scale_ptr += (row // seq_size) * N
+    shift_ptr += (row // seq_size) * N
+    for col_off in range(0, N, BLOCK_SIZE):
+        cols = col_off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        eles = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        x_hat = (eles - mean) * rstd
+        if weight_ptr is not None:
+            weights = tl.load(weight_ptr + cols, mask=mask, other=0.0)
+            x_hat = x_hat * weights
+        if bias_ptr is not None:
+            bias = tl.load(bias_ptr + cols, mask=mask, other=0.0)
+            x_hat = x_hat + bias
+        scales = tl.load(scale_ptr + cols, mask=mask, other=0.0)
+        shifts = tl.load(shift_ptr + cols, mask=mask, other=0.0)
+        y = x_hat * (1 + scales) + shifts
+        tl.store(y_ptr + cols, y, mask=mask)
+
+
+triton_adaptive_layer_norm_template = (
+    paddle_custom_op_head_part
+    + """
+
+int nextPowerOfTwo(int n) {
+    if (n == 0) {
+        return 1; // 0的下一个2的幂定义为1
+    }
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
+std::vector<paddle::Tensor> ${op_name}_func(
+    const paddle::Tensor &x,
+    const paddle::Tensor &scale,
+    const paddle::Tensor &shift,
+    paddle::optional<paddle::Tensor> &weight,
+    paddle::optional<paddle::Tensor> &bias,
+    float epsilon) {
+  int M = x.dims()[0] * x.dims()[1];
+  int N = x.dims()[2];
+  int seq_size = x.dims()[1];
+  int N_nextPowerOfTwo = nextPowerOfTwo(N);
+  int BLOCK_SIZE = N_nextPowerOfTwo < 1024 ? N_nextPowerOfTwo : 1024;
+  auto y = paddle::full({x.dims()[0], x.dims()[1], x.dims()[2]}, 0, x.dtype(), x.place());
+
+  auto dev_x = get_tensor_ptr(x);
+  auto dev_y = get_tensor_ptr(y);
+  auto dev_scale = get_tensor_ptr(scale);
+  auto dev_shift = get_tensor_ptr(shift);
+  CUdeviceptr dev_weight = (CUdeviceptr)(nullptr);
+  if (weight) {
+    dev_weight = get_tensor_ptr(*weight);
+  }
+  CUdeviceptr dev_bias = (CUdeviceptr)(nullptr);
+  if (bias) {
+    dev_bias = get_tensor_ptr(*bias);
+  }
+
+  auto run_triton_kernel = [&](int algo_id) -> CUresult{
+      return triton_adaptive_layer_norm_kernel(y.stream(),
+                                               dev_x,
+                                               dev_y,
+                                               dev_weight,
+                                               dev_bias,
+                                               dev_scale,
+                                               dev_shift,
+                                               M,
+                                               N,
+                                               seq_size,
+                                               epsilon,
+                                               algo_id);
+  };
+
+  std::vector<int> problem_size = {M, N};
+"""
+    + tune_and_invoke_part
+    + """
+  return {y};
+}
+
+std::vector<std::vector<int64_t>> ${op_name}_InferShape(
+        const std::vector<int64_t>& a_shape,
+        const std::vector<int64_t>& b_shape,
+        const std::vector<int64_t>& c_shape,
+        const std::vector<int64_t>& d_shape,
+        float epsilon) {
+  return {{a_shape[0], a_shape[1], a_shape[2]}};
+}
+
+std::vector<paddle::DataType> ${op_name}_InferDtype(const paddle::DataType& A_dtype) {
+    return {A_dtype};
+}
+
+PD_BUILD_OP(${op_name})
+    .Inputs({"x", "scale", "shift", paddle::Optional("weight"), paddle::Optional("bias")})
+    .Outputs({"out"})
+    .SetKernelFn(PD_KERNEL(${op_name}_func))
+    .Attrs({"epsilon: float"})
+    .SetInferDtypeFn(PD_INFER_DTYPE(${op_name}_InferDtype))
+    .SetInferShapeFn(PD_INFER_SHAPE(${op_name}_InferShape));
+"""
+)
+
+
+def adaptive_layer_norm(x, scale, shift, weight=None, bias=None, epsilon=1e-05):
+    ## 函数界限检查 和 参数准备
+    assert (
+        len(x.shape) == 3
+    ), "x should be 3-dim [batch_size, seq_size, feature_dim]"
+    if weight is not None:
+        assert len(weight.shape) == 1
+        assert (
+            weight.shape[-1] == x.shape[-1]
+        ), "x and weight should have same shape[-1] == feature_dim"
+    if bias is not None:
+        assert len(bias.shape) == 1
+        assert (
+            bias.shape[-1] == x.shape[-1]
+        ), "x and bias should have same shape[-1] == feature_dim"
+    assert (
+        len(scale.shape) == 2 and len(shift.shape) == 2
+    ), "scale and shift should be 2-dim [batch_size, feature_dim]"
+    assert (
+        scale.shape[0] == shift.shape[0] == x.shape[0]
+    ), "x, scale and shift should have same shape[0] == batch_size"
+    assert (
+        scale.shape[1] == shift.shape[1] == x.shape[-1]
+    ), "x, scale and shift should have same shape[-1] == feature_dim"
+
+    M = x.shape[0] * x.shape[1]
+    N = x.shape[2]
+    seq_size = x.shape[1]
+    BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
+
+    ## 暂时这样对齐动态图
+    # if in_dynamic_or_pir_mode():
+    #     y = paddle.empty_like(x)
+
+    #     adaptive_layer_norm_kernel[(M,)](
+    #         x,
+    #         y,
+    #         weight,
+    #         bias,
+    #         scale,
+    #         shift,
+    #         M,
+    #         N,
+    #         seq_size,
+    #         epsilon,
+    #         BLOCK_SIZE=BLOCK_SIZE,
+    #     )
+    #     return y
+
+    op_name = "triton_adaptive_layer_norm"
+
+    x_list = [M, N, seq_size, epsilon]
+
+    ## 如果在动态图模式下且算子已经添加好了，则直接调用自定义算子
+    # if (
+    #     op_name in OpProtoHolder.instance().op_proto_map.keys()
+    #     and in_dynamic_or_pir_mode()
+    # ):
+    #     outs = _C_ops._run_custom_op(
+    #         op_name, x, scale, shift, weight, bias, epsilon
+    #     )
+    #     return outs[0]
+
+    value_hint = get_value_hint(x_list)
+    dtypes = [x.dtype] * 6
+    address_hint = get_pointer_hint(dtypes)
+
+    python_package_name = f"{op_name}_package"
+    generated_dir = f"/tyk/Paddle/kai/triton/generated/{op_name}"
+    os.makedirs(generated_dir, exist_ok=True)
+
+    py_script_file = f"{generated_dir}/triton_kernels.py"
+    extract_triton_kernel(adaptive_layer_norm_kernel, py_script_file)
+
+    op_dict = {"op_name": op_name, "reset_zero_when_tune": " "}
+    op_dict[
+        "reset_zero_when_tune"
+    ] = "cudaMemset((void*)dev_y, 0, sizeof(x.dtype()) * M * N);"
+    paddle_custom_op_file_path = f"{generated_dir}/{op_name}.cu"
+    so_path = find_so_path(generated_dir, python_package_name)
+
+    if so_path is None:
+        with open(paddle_custom_op_file_path, "w") as f:
+            f.write(
+                SubstituteTemplate(triton_adaptive_layer_norm_template, op_dict)
+            )
+            f.close()
+
+        # ahead of time compile command.
+        aot_template = (
+            f"""{python_path}   {compile_file} {py_script_file}   -n adaptive_layer_norm_kernel -o {generated_dir}/{op_name}_kernel --out-name {op_name}_kernel  """
+            + """ -s "{address_hint} {value_hint}  {BLOCK_SIZE}"   \
+                             -g "M, 1, 1" \
+                       """
+        )
+
+        codegen_commands = []
+        codegen_command = aot_template.format(
+            address_hint=address_hint,
+            value_hint=value_hint,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        codegen_commands.append(codegen_command)
+        re = os.system(codegen_command)
+        assert re == 0
+        # multi_process_do(codegen_commands)
+
+        link_command = f"{python_path}  {link_file}  {generated_dir}/*.h -o {generated_dir}/{op_name}_kernel"
+        re = os.system(link_command)
+        assert re == 0
+
+        # rename the .c file to .cu
+        rename_c_to_cu(generated_dir)
+        # build the package to so, not install
+        build_package(generated_dir, python_package_name)
+
+    if op_name not in OpProtoHolder.instance().op_proto_map.keys():
+        so_path = find_so_path(generated_dir, python_package_name)
+        print("we find so_path: ", so_path)
+        assert so_path is not None
+        paddle.utils.cpp_extension.load_op_meta_info_and_register_op(so_path)
+
+    ## 执行算子
+    if in_dynamic_or_pir_mode():
+        print(f"-------- we are in dynamic mode, op_name: {op_name}")
+        outs = _C_ops._run_custom_op(
+            op_name, x, scale, shift, weight, bias, epsilon
+        )
+        return outs[0]
+    else:
+        print(f"-------- we are in static mode, op_name: {op_name}")
+        ## check_variable_and_dtype
+        helper = LayerHelper(op_name, **locals())
+        inputs = {
+            'x': x,
+            'scale': scale,
+            'shift': shift,
+            'weight@OPTIONAL': weight,
+            'bias@OPTIONAL': bias,
+        }
+        out = helper.create_variable_for_type_inference(dtype=x.dtype)
+        helper.append_op(
+            type=op_name,
+            inputs=inputs,
+            attrs={
+                'epsilon': epsilon,
+            },
+            outputs={'out': out},
+        )
+        return out
